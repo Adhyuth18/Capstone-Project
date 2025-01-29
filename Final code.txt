@@ -1,0 +1,155 @@
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import os
+
+# Define dataset paths
+train_original_path = "dataset/train/original"
+train_forged_path = "dataset/train/forged"
+test_original_path = "dataset/test/original"
+test_forged_path = "dataset/test/forged"
+
+# Function to derive FCC from input images
+def process_image(file_path):
+    image = cv2.imread(file_path)
+    if image is None:
+        return None
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Apply contrast enhancement (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    # Create False Color Composite (FCC)
+    false_color = cv2.applyColorMap(enhanced, cv2.COLORMAP_JET)
+    return cv2.resize(false_color, (128, 128)) / 255.0  # Normalize image
+
+# Function to process all images in a folder
+def load_fcc_images(folder):
+    images = []
+    for filename in os.listdir(folder):
+        img_path = os.path.join(folder, filename)
+        fcc_image = process_image(img_path)
+        if fcc_image is not None:
+            images.append(fcc_image)
+    return np.array(images)
+
+# Extract FCC images separately
+print("Processing train original images...")
+train_original_images = load_fcc_images(train_original_path)
+
+print("Processing train forged images...")
+train_forged_images = load_fcc_images(train_forged_path)
+
+print("Processing test original images...")
+test_original_images = load_fcc_images(test_original_path)
+
+print("Processing test forged images...")
+test_forged_images = load_fcc_images(test_forged_path)
+
+# Create labels: 0 for original, 1 for forged
+train_labels = np.concatenate((np.zeros(len(train_original_images)), np.ones(len(train_forged_images))))
+test_labels = np.concatenate((np.zeros(len(test_original_images)), np.ones(len(test_forged_images))))
+
+# Combine original and forged FCC images
+train_images = np.concatenate((train_original_images, train_forged_images))
+test_images = np.concatenate((test_original_images, test_forged_images))
+
+# Function to create image pairs for Siamese Network
+def create_pairs(images, labels):
+    pairs, pair_labels = [], []
+    num_images = len(images)
+    
+    for i in range(num_images):
+        for j in range(num_images):
+            if i != j:
+                pairs.append([images[i], images[j]])
+                pair_labels.append(1 if labels[i] != labels[j] else 0)  # 1 for different, 0 for same
+    
+    return np.array(pairs), np.array(pair_labels)
+
+# Create training and testing pairs
+train_pairs, train_pair_labels = create_pairs(train_images, train_labels)
+test_pairs, test_pair_labels = create_pairs(test_images, test_labels)
+
+# Define Siamese Network
+def build_siamese_model(input_shape):
+    base_model = keras.Sequential([
+        layers.Conv2D(64, (3, 3), activation='relu', input_shape=input_shape),
+        layers.MaxPooling2D(2, 2),
+        layers.Conv2D(128, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Conv2D(256, (3, 3), activation='relu'),
+        layers.MaxPooling2D(2, 2),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu')
+    ])
+    
+    input_a = keras.Input(shape=input_shape)
+    input_b = keras.Input(shape=input_shape)
+    
+    processed_a = base_model(input_a)
+    processed_b = base_model(input_b)
+    
+    distance = layers.Lambda(lambda tensors: tf.abs(tensors[0] - tensors[1]))([processed_a, processed_b])
+    output = layers.Dense(1, activation='sigmoid')(distance)
+    
+    model = keras.Model(inputs=[input_a, input_b], outputs=output)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    
+    return model
+
+# Train Siamese Network
+model = build_siamese_model((128, 128, 3))
+model.summary()
+
+print("Training the model...")
+history = model.fit(
+    [train_pairs[:, 0], train_pairs[:, 1]],
+    train_pair_labels,
+    batch_size=32,
+    epochs=10,
+    validation_split=0.2
+)
+
+# Save model
+model.save("signature_siamese_model.h5")
+
+# **Testing the Model**
+print("Testing the model...")
+test_loss, test_acc = model.evaluate([test_pairs[:, 0], test_pairs[:, 1]], test_pair_labels)
+print(f"Test Accuracy: {test_acc * 100:.2f}%")
+
+# **Plot Comparison of Training & Testing Accuracy**
+plt.figure(figsize=(8, 6))
+plt.plot(history.history['accuracy'], label='Train Accuracy', marker='o')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy', marker='o')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Training vs Validation Accuracy')
+plt.legend()
+plt.show()
+
+# **Function to Predict Forgery**
+def predict_signature(image1_path, image2_path, model):
+    img1 = process_image(image1_path)
+    img2 = process_image(image2_path)
+    
+    if img1 is None or img2 is None:
+        return "Error: Could not process one or both images."
+    
+    img1 = np.expand_dims(img1, axis=0)
+    img2 = np.expand_dims(img2, axis=0)
+    
+    prediction = model.predict([img1, img2])
+    return "Forged" if prediction[0][0] > 0.5 else "Original"
+
+# Example Testing with an Image Pair
+loaded_model = keras.models.load_model("signature_siamese_model.h5")
+test_result = predict_signature("dataset/test/original/sample1.png", "dataset/test/forged/sample2.png", loaded_model)
+print(f"Prediction: {test_result}")
